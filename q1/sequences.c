@@ -74,8 +74,8 @@ int main(int argc, char *argv[]) {
     struct Sequence *sequence = create_sequence();
 
     while(1) {
-        char command[4] = {0};
-        int result = scanf("%s", command);
+        char command[10] = {0};
+        int result = scanf("%9s", command);
         if(result == EOF) break;
         else if (result != 1) continue;
 

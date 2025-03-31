@@ -1,0 +1,433 @@
+#!/bin/bash
+# file_test_harness.sh
+#
+# Demonstration of capturing outputs to files instead of variables.
+# This version includes "-u" (ultimate mode) and "-b" (brute force mode).
+
+# --- Argument Parsing ---
+if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
+    echo "Usage: $0 myProg numTests [-u | -b]" >&2
+    exit 1
+fi
+
+profProg="./sequences_sample"
+myProg=$1
+numTests=$2
+
+ultimateMode=0
+bruteForceMode=0
+
+if [ "$#" -eq 3 ]; then
+    case "$3" in
+        "-u") ultimateMode=1 ;;
+        "-b") bruteForceMode=1 ;;
+        *) echo "Unknown option: $3" >&2; exit 1 ;;
+    esac
+fi
+
+# --- Initial Value ---
+initialValue=$(( RANDOM % 41 - 20 ))
+echo "Randomly generated initial value: $initialValue"
+
+TIMEOUT_DURATION=5
+testDir="tests_tmp"
+
+# ANSI colors
+GREEN=$'\033[1;32m'
+RED=$'\033[1;31m'
+RESET=$'\033[0m'
+
+# Global variable to accumulate full Valgrind logs.
+allValgrindLogs=""
+
+# Arrays for final summary reporting.
+declare -a summary_output_status summary_valgrind_status
+declare -a summary_ref_time summary_my_time summary_test_type summary_test_label
+
+# Track if everything passed
+allPassed=1
+
+# --- Setup and Cleanup ---
+mkdir -p "$testDir"
+cleanup() {
+    rm -rf "$testDir"
+}
+trap cleanup EXIT
+
+if ! command -v timeout &>/dev/null; then
+    echo "Error: 'timeout' command not found. Please install coreutils." >&2
+    exit 1
+fi
+
+# --- Test Case Generators ---
+generate_normal_test_case() {
+    local testCase=""
+    local numLines=$(( (RANDOM % 3) + 3 ))
+    for (( i=1; i<=numLines; i++ )); do
+        local line=""
+        local numCmds=$(( (RANDOM % 4) + 3 ))
+        for (( j=1; j<=numCmds; j++ )); do
+            if [ $(( RANDOM % 2 )) -eq 0 ]; then
+                op_index=$(( RANDOM % 4 ))
+                case $op_index in
+                    0) op="add" ;;
+                    1) op="sub" ;;
+                    2) op="mul" ;;
+                    3) op="div" ;;
+                esac
+                if [ "$op" = "div" ]; then
+                    operand=0
+                    while [ "${operand:-0}" -eq 0 ]; do
+                        operand=$(( (RANDOM % 21) - 10 ))
+                    done
+                else
+                    operand=$(( (RANDOM % 21) - 10 ))
+                fi
+                line+="$op $operand "
+            else
+                line+="n "
+            fi
+        done
+        testCase+="$line"$'\n'
+    done
+    echo -e "$testCase"
+}
+
+generate_whitespace_test_case() {
+    local testCase=""
+    local numLines=$(( (RANDOM % 3) + 3 ))
+    for (( i=1; i<=numLines; i++ )); do
+        local line=""
+        local numCmds=$(( (RANDOM % 4) + 3 ))
+        for (( j=1; j<=numCmds; j++ )); do
+            local preSpace=$(( (RANDOM % 5) + 1 ))
+            local midSpace=$(( (RANDOM % 5) + 1 ))
+            local postSpace=$(( (RANDOM % 5) + 1 ))
+            if [ $(( RANDOM % 2 )) -eq 0 ]; then
+                op_index=$(( RANDOM % 4 ))
+                case $op_index in
+                    0) op="add" ;;
+                    1) op="sub" ;;
+                    2) op="mul" ;;
+                    3) op="div" ;;
+                esac
+                if [ "$op" = "div" ]; then
+                    operand=0
+                    while [ "${operand:-0}" -eq 0 ]; do
+                        operand=$(( (RANDOM % 21) - 10 ))
+                    done
+                else
+                    operand=$(( (RANDOM % 21) - 10 ))
+                fi
+                line+=$(printf "%*s%s%*s%s%*s" $preSpace "" "$op" $midSpace "" "$operand" $postSpace "")
+                line+=" "
+            else
+                local spaces=$(( (RANDOM % 5) + 1 ))
+                line+=$(printf "%*s" $spaces "")
+                line+="n "
+            fi
+        done
+        testCase+="$line"$'\n'
+    done
+    echo -e "$testCase"
+}
+
+generate_large_test_case() {
+    local testCase=""
+    local numLines=$(( (RANDOM % 51) + 50 ))
+    for (( i=1; i<=numLines; i++ )); do
+        local line=""
+        local numCmds=$(( (RANDOM % 31) + 20 ))
+        for (( j=1; j<=numCmds; j++ )); do
+            if [ $(( RANDOM % 2 )) -eq 0 ]; then
+                op_index=$(( RANDOM % 4 ))
+                case $op_index in
+                    0) op="add" ;;
+                    1) op="sub" ;;
+                    2) op="mul" ;;
+                    3) op="div" ;;
+                esac
+                if [ "$op" = "div" ]; then
+                    operand=0
+                    while [ "${operand:-0}" -eq 0 ]; do
+                        operand=$(( (RANDOM % 21) - 10 ))
+                    done
+                else
+                    operand=$(( (RANDOM % 21) - 10 ))
+                fi
+                line+="$op $operand "
+            else
+                line+="n "
+            fi
+        done
+        testCase+="$line"$'\n'
+    done
+    echo -e "$testCase"
+}
+
+# --- Brute Force Generator (example) ---
+generate_increasing_test_case() {
+    local i="$1"
+    local baseLines=5
+    local baseCmds=5
+
+    local scaledLines=$(echo "$i * 1.5" | bc | cut -d'.' -f1)
+    local scaledCmds=$(echo "$i * 1.5" | bc | cut -d'.' -f1)
+
+    local numLines=$(( baseLines + scaledLines ))
+    local numCmdsBase=$(( baseCmds + scaledCmds ))
+
+    local testCase=""
+    for (( lineIndex=1; lineIndex<=numLines; lineIndex++ )); do
+        local line=""
+        local randomOffset=$(( RANDOM % 3 ))
+        local thisLineCmds=$(( numCmdsBase + randomOffset ))
+        for (( cmdIndex=1; cmdIndex<=thisLineCmds; cmdIndex++ )); do
+            if [ $(( RANDOM % 2 )) -eq 0 ]; then
+                op_index=$(( RANDOM % 4 ))
+                case $op_index in
+                    0) op="add" ;;
+                    1) op="sub" ;;
+                    2) op="mul" ;;
+                    3) op="div" ;;
+                esac
+                if [ "$op" = "div" ]; then
+                    operand=0
+                    while [ "${operand:-0}" -eq 0 ]; do
+                        operand=$(( (RANDOM % 21) - 10 ))
+                    done
+                else
+                    operand=$(( (RANDOM % 21) - 10 ))
+                fi
+                line+="$op $operand "
+            else
+                line+="n "
+            fi
+        done
+        testCase+="$line"$'\n'
+    done
+    echo -e "$testCase"
+}
+
+# Determine totalTests based on mode
+if [ "$ultimateMode" -eq 0 ] && [ "$bruteForceMode" -eq 0 ]; then
+    totalTests=$numTests
+elif [ "$ultimateMode" -eq 1 ]; then
+    totalTests=$(( numTests * 3 ))
+else
+    totalTests=$numTests
+fi
+
+testCounter=1
+
+run_test() {
+    # Usage: run_test <testIndex> <testCategory> <testFile>
+    local idx="$1"
+    local category="$2"
+    local file="$3"
+
+    summary_test_type[idx]="$category"
+    summary_test_label[idx]="Test $idx"
+
+    # Paths for capturing raw outputs
+    local profOutputFile="$testDir/profOutput_${idx}.txt"
+    local myOutputFile="$testDir/myOutput_${idx}.txt"
+
+    # --- Run Prof's Program ---
+    local startRef=$(date +%s.%N)
+    timeout "$TIMEOUT_DURATION" "$profProg" "$initialValue" < "$file" > "$profOutputFile" 2>&1
+    local retValProf=$?
+    local endRef=$(date +%s.%N)
+    local runtimeRef=$(echo "$endRef - $startRef" | bc)
+    if [ "$retValProf" -eq 124 ]; then
+        echo -e "${RED}TEST CASE $idx FAILED: Profs program timed out${RESET}"
+        summary_output_status[idx]="FAILED"
+        summary_ref_time[idx]="$runtimeRef"
+        summary_my_time[idx]="N/A"
+        summary_valgrind_status[idx]="N/A"
+        allPassed=0
+        return 1
+    fi
+
+    # --- Run Your Program ---
+    local startMy=$(date +%s.%N)
+    timeout "$TIMEOUT_DURATION" "$myProg" "$initialValue" < "$file" > "$myOutputFile" 2>&1
+    local retValMy=$?
+    local endMy=$(date +%s.%N)
+    local runtimeMy=$(echo "$endMy - $startMy" | bc)
+    if [ "$retValMy" -eq 124 ]; then
+        echo -e "${RED}TEST CASE $idx FAILED: Your program timed out${RESET}"
+        summary_output_status[idx]="FAILED"
+        summary_ref_time[idx]="$runtimeRef"
+        summary_my_time[idx]="$runtimeMy"
+        summary_valgrind_status[idx]="N/A"
+        allPassed=0
+        return 1
+    fi
+
+    # --- Display Outputs ---
+    echo "PROFS OUTPUT:"
+    cat "$profOutputFile"
+    echo "YOUR OUTPUT:"
+    cat "$myOutputFile"
+
+    # --- Diff them ---
+    diffOutput=$(diff -u "$profOutputFile" "$myOutputFile")
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}TEST CASE $idx FAILED (Output Diff)${RESET}"
+        echo "===== DIFF OUTPUT ====="
+        echo "$diffOutput"
+        summary_output_status[idx]="FAILED"
+        allPassed=0
+    else
+        echo -e "${GREEN}TEST CASE $idx PASS (Output Match)${RESET}"
+        summary_output_status[idx]="PASS"
+    fi
+
+    # Record times
+    summary_ref_time[idx]="$runtimeRef"
+    summary_my_time[idx]="$runtimeMy"
+
+    # Clean up the output files (optional — you can keep them if you want)
+    rm -f "$profOutputFile" "$myOutputFile"
+
+    # --- Valgrind ---
+    local valgrindLogFile="$testDir/valgrind_${idx}.log"
+    timeout "$TIMEOUT_DURATION" valgrind --leak-check=full --error-exitcode=1 \
+        --log-file="$valgrindLogFile" \
+        "$myProg" "$initialValue" < "$file" > /dev/null 2>&1
+
+    local retValValgrind=$?
+    if [ "$retValValgrind" -ne 0 ]; then
+        summary_valgrind_status[idx]="FAILED"
+        allPassed=0
+    else
+        summary_valgrind_status[idx]="PASS"
+    fi
+
+    local currentValgrindOutput
+    currentValgrindOutput=$(cat "$valgrindLogFile")
+    allValgrindLogs+="Test case $idx Valgrind Log:\n$currentValgrindOutput\n\n"
+}
+
+if [ "$ultimateMode" -eq 1 ]; then
+    # Ultimate mode: Normal, Whitespace, Large
+    for category in Normal Whitespace Large; do
+        for (( i=1; i<=numTests; i++ )); do
+            echo "=================================="
+            echo "GENERATED TEST CASE $testCounter [$category]:"
+            testFile="$testDir/testCase_${testCounter}.in"
+            case $category in
+                Normal)     testInput=$(generate_normal_test_case) ;;
+                Whitespace) testInput=$(generate_whitespace_test_case) ;;
+                Large)      testInput=$(generate_large_test_case) ;;
+            esac
+            printf '%b' "$testInput" > "$testFile"
+
+            cat "$testFile"
+            echo
+
+            run_test "$testCounter" "$category" "$testFile"
+            # If run_test returned 1, a time-out occurred, so we can break if you want:
+            ((testCounter++))
+        done
+    done
+
+elif [ "$bruteForceMode" -eq 1 ]; then
+    # Brute force mode
+    for (( i=1; i<=numTests; i++ )); do
+        echo "=================================="
+        echo "GENERATED TEST CASE $i [Brute Force]:"
+
+        testFile="$testDir/testCase_${i}.in"
+        testInput=$(generate_increasing_test_case "$i")
+        printf '%b' "$testInput" > "$testFile"
+
+        cat "$testFile"
+        echo
+
+        run_test "$i" "BruteForce" "$testFile"
+    done
+
+else
+    # Normal mode (single category)
+    for (( t=1; t<=numTests; t++ )); do
+        echo "=================================="
+        echo "GENERATED TEST CASE $t [Normal]:"
+        testFile="$testDir/testCase_${t}.in"
+        testInput=$(generate_normal_test_case)
+        printf '%b' "$testInput" > "$testFile"
+
+        cat "$testFile"
+        echo
+
+        run_test "$t" "Normal" "$testFile"
+    done
+fi
+
+echo "=================================="
+
+if [ "$allPassed" -eq 1 ]; then
+    echo -e "${GREEN}All tests passed${RESET}"
+fi
+
+# --- Full Valgrind Logs ---
+echo -e "\nFull Valgrind Summary Output for your program:\n"
+echo -e "$allValgrindLogs"
+
+# --- Final Summary Report ---
+echo -e "\nFINAL TEST SUMMARY REPORT:\n"
+
+print_summary_line() {
+    local label="$1"
+    local type="$2"
+    local outStatus="$3"
+    local valStatus="$4"
+    local refTime="$5"
+    local myTime="$6"
+
+    # Colorize pass/fail
+    local outColor valColor
+    if [ "$outStatus" = "PASS" ]; then
+        outColor="${GREEN}PASS${RESET}"
+    elif [ "$outStatus" = "FAILED" ]; then
+        outColor="${RED}FAILED${RESET}"
+    else
+        outColor="$outStatus"
+    fi
+
+    if [ "$valStatus" = "PASS" ]; then
+        valColor="${GREEN}PASS${RESET}"
+    elif [ "$valStatus" = "FAILED" ]; then
+        valColor="${RED}FAILED${RESET}"
+    else
+        valColor="$valStatus"
+    fi
+
+    printf "%-10s %-12s %-8s %-8s %-18s %-18s\n" \
+           "$label" "$type" "$outColor" "$valColor" "$refTime" "$myTime"
+}
+
+# Decide how many rows to print in summary
+if [ "$ultimateMode" -eq 1 ]; then
+    totalRows=$(( numTests * 3 ))
+elif [ "$bruteForceMode" -eq 1 ]; then
+    totalRows=$numTests
+else
+    totalRows=$numTests
+fi
+
+# Print header
+printf "%-10s %-12s %-8s %-8s %-18s %-18s\n" \
+       "Test Case" "Type" "Output" "Valgrind" "Profs Runtime" "My Prog Runtime"
+
+for (( i=1; i<=totalRows; i++ )); do
+    label="${summary_test_label[i]}"
+    type="${summary_test_type[i]}"
+    outStatus="${summary_output_status[i]:-N/A}"
+    valStatus="${summary_valgrind_status[i]:-N/A}"
+    refTime="${summary_ref_time[i]:-N/A}"
+    myTime="${summary_my_time[i]:-N/A}"
+
+    print_summary_line "$label" "$type" "$outStatus" "$valStatus" "$refTime" "$myTime"
+done
